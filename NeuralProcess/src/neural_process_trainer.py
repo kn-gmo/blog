@@ -1,168 +1,176 @@
 import torch
+from torch import nn
 from torch.distributions import Normal
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 
-from neural_process_model import get_npmodel
-#from NeuralProcess.src.neural_process_model import get_npmodel
 
 class NeuralProcessTrainer(object):
 
-    def __init__(self, model, learning_rate=1e-3):
+    def __init__(self, model, ngpu, z_draw=20, learning_rate=1e-3, viz_dir=None, load_model=True):
+
+        self.ngpu = ngpu
+        self.device = torch.device("cuda:0" if (torch.cuda.is_available() and ngpu > 0)
+                                   else "cpu")
+        print("device: {}, gpu: {}".format(self.device, self.ngpu))
+
+        self.viz_dir = viz_dir
         self.model = model
+
+        if load_model:
+            self.load_model()
+        else:
+            self.model.init(self.device, self.ngpu)
+
+
         params = list(self.model.Encoder.parameters()) \
                + list(self.model.ZMeanStdFunc.parameters()) \
                + list(self.model.Decoder.parameters())
         self.optimizer = torch.optim.Adam(params, lr=learning_rate)
+        self.N_z = z_draw
+        self.train_losses = []
+        self.count_epochs = 1
+        print(self.model)
+        if self.viz_dir is not None:
+            os.makedirs(self.viz_dir, exist_ok=True)
 
     def _calc_zparam(self, x, y):
-        output = self.model.Encoder(x, y)
-        output = torch.mean(output, dim=-2)  # aggregate for r_N
-        output = self.model.ZMeanStdFunc(output)
-        return output
+        """
 
-    def _sample_z(self, mu, std, z_draw):
-        mu = mu.unsqueeze(dim=-2).expand(z_draw, -1)
-        eps = torch.autograd.Variable(std.data.new(mu.shape).normal_())
+        :param x: [batch, N_sample, x_dim]
+        :param y: [batch, N_sample, y_dim]
+        :return: mean and std of the noraml dist of z_param [batch, z_dim]
+        """
+        r = self.model.Encoder(x, y)
+        r_mean = torch.mean(r, dim=-2)  # aggregate for N_sample
+        mu, std = self.model.ZMeanStdFunc(r_mean)
+        return mu, std
+
+    def _sample_z(self, mu, std, N_z):
+        mu = mu.unsqueeze(dim=-2).expand(-1, N_z, -1)
+        std = std.unsqueeze(dim=-2).expand(-1, N_z, -1)
+        eps = torch.randn_like(mu, device=self.device)
         return mu + std * eps
 
-    def _loss_function(self, x_context, y_context, x_target, y_target, z_draw):
+    def _loss_function(self, x_context, y_context, x_target, y_target):
+        """
 
+        :param x_context:  [batch, N_con, x_dim]
+        :param y_context:  [batch, N_con, y_dim]
+        :param x_target:   [batch, N_tar, x_dim]
+        :param y_target:  [batch, N_tar, x_dim]
+        :return:
+        """
         x_all = torch.cat([x_context, x_target], dim=-2)
         y_all = torch.cat([y_context, y_target], dim=-2)
 
-        (z_all_mu, z_all_sigma) = self._calc_zparam(x_all, y_all)
-        (z_c_mu, z_c_sigma) = self._calc_zparam(x_context, y_context)
-        z_all_sample = self._sample_z(z_all_mu, z_all_sigma, z_draw)
-        (y_mu, y_sigma) = self.model.Decoder(z_all_sample, x_target)
-        y_normal = Normal(loc=y_mu, scale=y_sigma)
+        z_all_mu, z_all_sigma = self._calc_zparam(x_all, y_all) # z_all [batch, z_dim]
+        z_c_mu, z_c_sigma = self._calc_zparam(x_context, y_context) # z_c [batch, z_dim]
+        z_all_sample = self._sample_z(z_all_mu, z_all_sigma, self.N_z) # z_all_sample [batch, N_z, z_dim]
+        y_t_mu, y_t_sigma = self.model.Decoder(z_all_sample, x_target) # y_t [batch, N_t, N_z, y_dim]
+        y_normal = Normal(loc=y_t_mu, scale=y_t_sigma)
+        y_target_exd = y_target.unsqueeze(dim=-2).expand(-1, -1, self.N_z, -1)  # to [batch, N_t,  N_z, y_dim]
+        loglik = -y_normal.log_prob(y_target_exd).sum(dim=[-1,-3]).mean() # sum for N_t, y_dim, mean for N_z, batch
+        kldiv = NeuralProcessTrainer.calc_kldiv_gaussian(z_all_mu, z_all_sigma, z_c_mu, z_c_sigma) # sum for z_dim, mean for batch
+        return loglik, kldiv
 
-        y_target_exp = y_target.unsqueeze(dim=-2).expand(-1, z_draw, -1)  # dim is expanded to [target_N,  z_draw, y_dim]
-        loglik = y_normal.log_prob(y_target_exp).mean(dim=-2).sum(dim=(-1,-2)) # sum for y_dim, y_target, mean for z_draw
-        kldiv = NeuralProcessTrainer.calc_kldiv_gaussian(z_all_mu, z_all_sigma, z_c_mu, z_c_sigma)
-        loss = -loglik + kldiv
-        return loss
-
-    def train(self, x, y, z_draw=10):
+    def calc_batch_loss(self, batch):
         """
-
-        :param x: [N, x_dim]
-        :param y: [N, y_dim]
         :param z_draw: the number of sampling of z
         :return:
         """
+        x, y = batch
+        x = x.to(self.device) #[batch, N, x_dim]
+        y = y.to(self.device) #[batch, N, y_dim]
+        ctx_N = np.random.randint(3, x.size(1))
+        index_random = torch.randperm(x.size(1))
+        x_ctx = x[:, index_random[:ctx_N], :]
+        y_ctx = y[:, index_random[:ctx_N], :]
+        x_tgt = x[:, index_random[ctx_N:], :]
+        y_tgt = y[:, index_random[ctx_N:], :]
+        l_loglik, l_kldiv = self._loss_function(x_ctx, y_ctx, x_tgt, y_tgt)
+        return l_loglik, l_kldiv
 
-        x_tensor = torch.from_numpy(x)
-        y_tensor = torch.from_numpy(y)
+    def train(self, num_epochs, train_iter):
+        self.model.train()
+        min_loss = 1e9
+        for epoch in range(num_epochs):
+            train_losses_eopch = []
+            for i, batch in enumerate(train_iter):
+                #print("Epch[%d] %d/%d" %(epoch, i, len(train_iter)))
+                self.optimizer.zero_grad()
+                loss_loglik, loss_kldiv = self.calc_batch_loss(batch)
+                loss = loss_loglik + loss_kldiv
+                loss.backward()
+                self.optimizer.step()
+                train_losses_eopch.append((loss.item(), loss_loglik.item(), loss_kldiv.item()))
+            tot_mloss, lglk_mloss, kld_mloss = np.mean(train_losses_eopch, axis=0)
+            print("Epoch[%d]: Total loss: %.4f, Loglike part: %.4f, KLDiv part: %.4f" %(self.count_epochs, tot_mloss,
+                  lglk_mloss, kld_mloss))
 
-        ctx_N = np.random.randint(1, len(x_tensor))
+            if tot_mloss < min_loss:
+                self.save_model()
+                min_loss = tot_mloss
+                print("model is saved!""")
 
-        index_random = torch.randperm(len(x_tensor))
-        x_ctx = x_tensor[index_random[:ctx_N]]
-        y_ctx = y_tensor[index_random[:ctx_N]]
-        x_tgt = x_tensor[index_random[ctx_N:]]
-        y_tgt = y_tensor[index_random[ctx_N:]]
+            self.count_epochs += 1
+            self.train_losses.extend(train_losses_eopch)
 
-        self.optimizer.zero_grad()
-        loss = self._loss_function(x_ctx, y_ctx, x_tgt, y_tgt, z_draw)
-        loss.backward()
-        train_loss = loss.item()
-        self.optimizer.step()
-        return train_loss
-
-    def posterior_predict(self, x_obs, y_obs, x_new, z_draw=10):
+    def posterior_predict(self, x_obs, y_obs, x_new, z_draw=20):
         """
 
-        :param x_obs: [N_obs, x_dim]
-        :param y_obs: [N_obs, y_dim]
-        :param x_new: [N_new, x_dim]
-        :param z_draw:
-        :return:
+        :param x_obs: [batch, N_obs, x_dim]
+        :param y_obs: [batch, N_obs, y_dim]
+        :param x_new: [batch, N_new, x_dim]
+        :return: return mean[batch, N_new, N_z, y_dim] of posterior dist of y
         """
-
-        x_obs_tensor = torch.from_numpy(x_obs)
-        y_obs_tensor = torch.from_numpy(y_obs)
-        x_new_tensor = torch.from_numpy(x_new)
-
-        if len(x_obs_tensor) == 0:
+        self.model.eval()
+        if len(x_obs) == 0:
             # prior dist
             z_dim = self.model.z_dim
             z_normal = Normal(loc=torch.zeros(z_dim), scale=1.0)
             z_all_sample = z_normal.sample(sample_shape=(z_draw,))
         else:
-            z_mu, z_sigma = self._calc_zparam(x_obs_tensor, y_obs_tensor)
+            z_mu, z_sigma = self._calc_zparam(x_obs, y_obs)
             z_all_sample = self._sample_z(z_mu, z_sigma, z_draw)
 
-        (y_mu, y_sigma) = self.model.Decoder(z_all_sample, x_new_tensor)
-        return y_mu.data.numpy()
+        y_mu, y_sigma = self.model.Decoder(z_all_sample, x_new)
+        return y_mu.detach(), y_sigma.detach()
+
+    def viz_loss(self):
+        fig = plt.figure()
+        plt.style.use('ggplot')
+        plt.rcParams["figure.figsize"] = (8,6)
+        labels=["Total", "LogLike part", "KLDiv part"]
+        train_losses = np.array(self.train_losses)
+        for i, label in enumerate(labels):
+            plt.plot(np.linspace(1, self.count_epochs, len(train_losses)),
+                 train_losses[:,i], "-", label=label)
+        plt.legend()
+        fig.savefig(self.viz_dir + '/loss.png')
 
     @staticmethod
     def calc_kldiv_gaussian(q_mu, q_std, p_mu, p_std):
+        """
+            D_kl(q|p)
+        """
         q_var = q_std ** 2
         p_var = p_std ** 2
         p_var_dev = 1. / p_var
         ret = (q_var + (q_mu - p_mu) ** 2) * p_var_dev - torch.log(q_var * p_var_dev) - 1.
-        ret = 0.5 * ret.sum()
+        ret = 0.5 * ret.sum(dim=-1).mean() #sum for z_dim, mean for batch
         return ret
 
-def sample_constant(n):
-    #x = np.linspace(-4, 4, n).reshape(n,1).astype(np.float32)
-    x = np.random.uniform(low=-4.0, high=4.0, size=(n,1)).astype(np.float32)
-    y = np.sin(x).astype(np.float32)
-    return x, y
+    def save_model(self):
+        savepath = self.viz_dir + '/model.pt'
+        self.model.uninit()
+        torch.save(self.model.state_dict(), savepath)
+        self.model.init(self.device, self.ngpu)
 
-def sample_random(n):
-    x = np.random.uniform(low=-4.0, high=4.0, size=(n,1)).astype(np.float32)
-    #x = np.linspace(-4, 4, n).reshape(n,1).astype(np.float32)
-    a = np.random.uniform(low=-2., high=2.)
-    y = (a * np.sin(x)).astype(np.float32)
-    return x, y
-
-def train():
-    model = get_npmodel(1, 1)
-    obj = NeuralProcessTrainer(model)
-    train_iter = int(1e5)
-    log_interval = int(5e3)
-
-    loss = 0.
-    for ite in range(train_iter):
-        x, y = sample_constant(10)
-        x, y = sample_random(10)
-        if ite % log_interval == 0:
-            print("{} times Loss: {}".format(ite, loss))
-            x_t = np.linspace(-6, 6, 100).reshape(100,1).astype(np.float32)
-            y_t_pred = obj.posterior_predict(x, y, x_t, 20)
-            plt.plot(x, y, '.')
-            for i in range(y_t_pred.shape[1]):
-                plt.plot(x_t, y_t_pred[:, i, 0], color="gray", alpha=0.5)
-                plt.title("Trained after {} times".format(ite))
-            plt.pause(.1)
-            plt.clf()
-
-        loss = obj.train(x, y)
-
-    return obj
-
-def show_fig(obj, n_obs_list):
-    plt.figure()
-    for i, n in enumerate(n_obs_list):
-        plt.subplot(2, 2, i+1)
-
-        #x_o, y_o = sample_constant(n)
-        x_o, y_o = sample_random(n)
-
-        plt.plot(x_o, y_o, 'o', color="black")
-
-        x_t = np.linspace(-6, 6, 100).reshape(100, 1).astype(np.float32)
-        y_t_pred = obj.posterior_predict(x_o, y_o, x_t, 20)
-        y_t = np.sin(x_t)
-        #plt.plot(x_t, y_t, '-', color="black")
-        for i in range(y_t_pred.shape[1]):
-            plt.plot(x_t, y_t_pred[:, i, 0], alpha=0.5)
-        plt.title("n_obs = {}".format(n))
-    plt.show()
-
-if __name__ == "__main__":
-    obj = train()
-    show_fig(obj, [0, 2, 5, 10])
-    show_fig(obj, [0, 1, 1, 1])
+    def load_model(self):
+        load_path = self.viz_dir + '/model.pt'
+        if os.path.isfile(load_path):
+            state = torch.load(load_path)
+            self.model.load_state_dict(state)
+        self.model.init(self.device, self.ngpu)
